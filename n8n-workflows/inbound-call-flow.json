@@ -1,0 +1,222 @@
+{
+  "name": "Inbound Call Workflow",
+  "nodes": [
+    {
+      "parameters": {},
+      "name": "Start",
+      "type": "n8n-nodes-base.start",
+      "typeVersion": 1,
+      "position": [
+        250,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "webhook/inbound-call",
+        "options": {}
+      },
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        450,
+        300
+      ],
+      "webhookId": "inbound-call"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json.body.event}}",
+              "operation": "equal",
+              "value2": "call_started"
+            }
+          ]
+        }
+      },
+      "name": "Is Call Started",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        650,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/api/inbound/call",
+        "options": {
+          "body": {
+            "callId": "={{$json.body.callId}}",
+            "from": "={{$json.body.from}}",
+            "to": "={{$json.body.to}}",
+            "state": "started"
+          },
+          "headers": {
+            "x-openphone-signature": "={{$json.headers['x-openphone-signature']}}"
+          }
+        }
+      },
+      "name": "Start Conversation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        850,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json.body.event}}",
+              "operation": "equal",
+              "value2": "call_ended"
+            }
+          ]
+        }
+      },
+      "name": "Is Call Ended",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        850,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/api/inbound/hangup",
+        "options": {
+          "body": {
+            "callId": "={{$json.body.callId}}",
+            "state": "ended"
+          },
+          "headers": {
+            "x-openphone-signature": "={{$json.headers['x-openphone-signature']}}"
+          }
+        }
+      },
+      "name": "End Conversation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        1050,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Log the incoming event\nconsole.log('Received event:', $input.all());\n\n// Return a success response regardless\nreturn [\n  {\n    json: {\n      success: true,\n      message: 'Webhook received'\n    }\n  }\n];"
+      },
+      "name": "Format Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1250,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}",
+        "options": {}
+      },
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1450,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Is Call Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Call Started": {
+      "main": [
+        [
+          {
+            "node": "Start Conversation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Is Call Ended",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start Conversation": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Call Ended": {
+      "main": [
+        [
+          {
+            "node": "End Conversation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "End Conversation": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+} 

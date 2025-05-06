@@ -1,0 +1,77 @@
+services:
+  # Main API service
+  - type: web
+    name: voice-agents-api
+    runtime: docker
+    repo: https://github.com/yourusername/voice-agents-system
+    branch: main
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      - key: OPENPHONE_API_KEY
+        sync: false
+      - key: OPENPHONE_WEBHOOK_SECRET
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: ELEVENLABS_VOICE_ID
+        sync: false
+      - key: ELEVENLABS_AGENT_ID
+        sync: false
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_ENVIRONMENT
+        sync: false
+      - key: PINECONE_INDEX_NAME
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: API_BASE_URL
+        value: https://voice-agents-api.onrender.com
+    plan: standard
+    healthCheckPath: /health
+    autoDeploy: true
+
+  # n8n service for workflow automation
+  - type: web
+    name: voice-agents-n8n
+    runtime: docker
+    repo: https://github.com/n8n-io/n8n
+    branch: master
+    envVars:
+      - key: N8N_PORT
+        value: 5678
+      - key: N8N_PROTOCOL
+        value: https
+      - key: N8N_HOST
+        value: voice-agents-n8n.onrender.com
+      - key: N8N_ENCRYPTION_KEY
+        sync: false
+      - key: N8N_USER_FOLDER
+        value: /tmp/n8n
+      - key: WEBHOOK_URL
+        value: https://voice-agents-n8n.onrender.com
+      - key: API_BASE_URL
+        value: https://voice-agents-api.onrender.com
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: ELEVENLABS_AGENT_ID
+        sync: false
+      - key: KNOWLEDGE_BASE_SOURCE
+        value: ./knowledge
+      - key: ADMIN_EMAIL
+        sync: false
+    plan: standard
+    healthCheckPath: /health
+    autoDeploy: false 
