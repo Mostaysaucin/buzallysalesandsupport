@@ -10,6 +10,7 @@ An integrated voice agent system for both inbound support and outbound sales cal
 - **Workflow Automation**: n8n CLI for building and maintaining workflows
 - **Voice/AI**: ElevenLabs for text-to-speech and conversational AI
 - **Knowledge Base**: Vector database (Pinecone) for storing and retrieving information
+- **Audio Processing**: ffmpeg for format conversion between ElevenLabs and Twilio
 
 ## System Architecture
 
@@ -19,6 +20,7 @@ The system consists of several interconnected components:
 2. **n8n Workflows**: For orchestrating interactions and scheduling outbound calls
 3. **Knowledge Base**: Vector database with embeddings for agent responses
 4. **ElevenLabs Integration**: For voice synthesis and conversational AI
+5. **Redis**: For inter-process communication and session management
 
 ## Features
 
@@ -31,6 +33,7 @@ The system consists of several interconnected components:
   - Initiates calls to leads via Twilio
   - Conducts sales conversations using ElevenLabs AI
   - Follows scripts from the knowledge base with dynamic responses
+  - Automatically converts audio formats for seamless communication
 
 - **Knowledge Management**:
   - Vector database for semantic search
@@ -42,16 +45,18 @@ The system consists of several interconnected components:
 ### Prerequisites
 
 - Node.js 18 or later
+- Redis server (for session management and message passing)
 - Accounts with OpenPhone, Twilio, ElevenLabs, and Pinecone
 - n8n CLI (for workflow development)
 - Render account (for deployment)
+- ffmpeg (for audio format conversion)
 
 ### Local Development
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/voice-agents-system.git
-   cd voice-agents-system
+   git clone https://github.com/Mostaysaucin/buzallysalesandsupport.git
+   cd buzallysalesandsupport
    ```
 
 2. Install dependencies:
@@ -65,9 +70,19 @@ The system consists of several interconnected components:
    # Edit .env with your API keys and configuration
    ```
 
-4. Start the development server:
+4. Start the server and worker processes:
    ```bash
-   npm run dev
+   # Start the main server
+   node server.js
+   
+   # In a separate terminal, start the worker process
+   node queueWorker.js
+   ```
+
+5. For testing an outbound call:
+   ```bash
+   # Run this in a separate terminal - DO NOT run the worker with --test flag
+   node ../queueWorker.js --test +DESTINATION_NUMBER +YOUR_TWILIO_NUMBER
    ```
 
 ### n8n Workflow Setup
@@ -100,11 +115,18 @@ Important environment variables required for the application:
 # Server Configuration
 PORT=3000
 NODE_ENV=development
+PUBLIC_URL=your_public_url_or_ngrok_tunnel
+
+# Redis Configuration
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=optional_password
 
 # Twilio (Outbound Agent)
 TWILIO_ACCOUNT_SID=your_twilio_account_sid
 TWILIO_AUTH_TOKEN=your_twilio_auth_token
 TWILIO_PHONE_NUMBER=your_twilio_phone_number
+TWILIO_VERIFIED_NUMBER=your_verified_testing_number
 
 # OpenPhone (Inbound Agent)
 OPENPHONE_API_KEY=your_openphone_api_key
@@ -137,7 +159,7 @@ OPENAI_API_KEY=your_openai_api_key
 - `POST /api/outbound/call` - Initiate outbound call
 - `GET /api/outbound/twiml/:sessionId` - Generate TwiML for call
 - `POST /api/outbound/status/:sessionId` - Process call status updates
-- `POST /api/outbound/speech/:sessionId` - Process speech input
+- `POST /api/outbound/stream/:sessionId` - WebSocket endpoint for Twilio Media Streams
 
 ### Knowledge Base
 
@@ -145,6 +167,23 @@ OPENAI_API_KEY=your_openai_api_key
 - `GET /api/knowledge/query` - Query knowledge base
 - `DELETE /api/knowledge/:id` - Delete item from knowledge base
 - `POST /api/knowledge/batch` - Batch import to knowledge base
+
+## Troubleshooting
+
+### Audio Format Compatibility
+
+This system includes a solution to address the audio format incompatibility between ElevenLabs and Twilio:
+- ElevenLabs always returns MP3 audio regardless of requested format
+- Twilio requires μ-law 8kHz audio for bidirectional streams
+- The system automatically converts audio formats using ffmpeg
+
+### Process Management
+
+- The application requires two separate processes to run properly:
+  1. `server.js` - Handles HTTP and WebSocket connections
+  2. `queueWorker.js` - Processes call queue and maintains ElevenLabs sessions
+- Never run the worker with the `--test` flag for production use as it will terminate after initiating a call
+- For testing, use a separate test harness that initiates calls while the main processes handle the actual call flow
 
 ## License
 
