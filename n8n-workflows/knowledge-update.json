@@ -1,0 +1,247 @@
+{
+  "name": "Knowledge Base Update Workflow",
+  "nodes": [
+    {
+      "parameters": {},
+      "name": "Start",
+      "type": "n8n-nodes-base.start",
+      "typeVersion": 1,
+      "position": [
+        250,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 1 * * *"
+            }
+          ]
+        }
+      },
+      "name": "Daily Update Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        450,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "filePath": "={{$env.KNOWLEDGE_BASE_SOURCE}}"
+      },
+      "name": "Read Knowledge Directory",
+      "type": "n8n-nodes-base.readFileFromDisk",
+      "typeVersion": 1,
+      "position": [
+        650,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Parse the content based on file extension\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  try {\n    const filePath = item.json.path;\n    const extension = filePath.split('.').pop().toLowerCase();\n    const content = item.json.content;\n    \n    // Only process text-based files\n    if (['txt', 'md', 'csv', 'json', 'html'].includes(extension)) {\n      // Process based on extension\n      let processedContent;\n      \n      switch (extension) {\n        case 'json':\n          try {\n            const jsonData = JSON.parse(content);\n            // Handle different JSON structures\n            if (Array.isArray(jsonData)) {\n              // It's an array of items\n              for (const entry of jsonData) {\n                results.push({\n                  text: entry.text || JSON.stringify(entry),\n                  type: entry.type || 'sales',\n                  metadata: {\n                    source: filePath,\n                    timestamp: new Date().toISOString(),\n                    ...entry.metadata\n                  }\n                });\n              }\n              continue; // Skip the default push below\n            }\n            // It's a single object\n            processedContent = JSON.stringify(jsonData);\n          } catch (e) {\n            // If JSON parsing fails, treat as plain text\n            console.log(`Error parsing JSON file ${filePath}: ${e.message}`);\n            processedContent = content;\n          }\n          break;\n        \n        case 'csv':\n          // Simple CSV parsing (in real app, use a proper CSV parser)\n          const lines = content.split('\\n');\n          if (lines.length > 1) {\n            const headers = lines[0].split(',');\n            \n            for (let i = 1; i < lines.length; i++) {\n              const values = lines[i].split(',');\n              if (values.length === headers.length) {\n                const entry = {};\n                \n                // Create object from CSV row\n                headers.forEach((header, index) => {\n                  entry[header.trim()] = values[index].trim();\n                });\n                \n                results.push({\n                  text: entry.text || values.join(' '),\n                  type: entry.type || 'sales',\n                  metadata: {\n                    source: filePath,\n                    line: i,\n                    timestamp: new Date().toISOString()\n                  }\n                });\n              }\n            }\n            continue; // Skip the default push below\n          }\n          processedContent = content;\n          break;\n          \n        default:\n          processedContent = content;\n      }\n      \n      // Default item creation\n      results.push({\n        text: processedContent,\n        type: filePath.includes('sales') ? 'sales' : 'support',\n        metadata: {\n          source: filePath,\n          timestamp: new Date().toISOString()\n        }\n      });\n    }\n  } catch (error) {\n    console.error(`Error processing file: ${error.message}`);\n  }\n}\n\n// Return the processed items\nreturn results.map(item => ({ json: item }));"
+      },
+      "name": "Process Knowledge Files",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        850,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {
+          "reset": true
+        }
+      },
+      "name": "Batch Knowledge Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 2,
+      "position": [
+        1050,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/api/knowledge/batch",
+        "method": "POST",
+        "options": {
+          "body": {
+            "items": "={{$json}}"
+          }
+        }
+      },
+      "name": "Update Knowledge Base",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        1250,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 2,
+        "unit": "seconds"
+      },
+      "name": "Rate Limit",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [
+        1450,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$node[\"Batch Knowledge Items\"].context[\"noItemsLeft\"]}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "name": "All Items Processed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        1650,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Get stats from the previous operations\nconst batches = $input.all();\nlet totalItems = 0;\nlet successItems = 0;\nlet failedItems = 0;\n\n// Calculate stats from all batch responses\nfor (const batch of batches) {\n  if (batch.json.succeeded) {\n    totalItems += batch.json.succeeded + batch.json.failed;\n    successItems += batch.json.succeeded;\n    failedItems += batch.json.failed;\n  }\n}\n\n// Generate the report\nreturn [\n  {\n    json: {\n      status: 'completed',\n      timestamp: new Date().toISOString(),\n      stats: {\n        totalItems,\n        successItems,\n        failedItems,\n        successRate: totalItems > 0 ? (successItems / totalItems * 100).toFixed(2) + '%' : '0%'\n      },\n      message: `Knowledge base update completed. Processed ${totalItems} items with ${successItems} successful updates.`\n    }\n  }\n];"
+      },
+      "name": "Generate Report",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1850,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "to": "={{$env.ADMIN_EMAIL}}",
+        "subject": "Knowledge Base Update Complete",
+        "text": "=Knowledge Base Update Report\n\nStatus: {{$json.status}}\nTimestamp: {{$json.timestamp}}\n\nStatistics:\n- Total Items: {{$json.stats.totalItems}}\n- Successfully Updated: {{$json.stats.successItems}}\n- Failed Updates: {{$json.stats.failedItems}}\n- Success Rate: {{$json.stats.successRate}}\n\n{{$json.message}}",
+        "options": {}
+      },
+      "name": "Send Report Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 1,
+      "position": [
+        2050,
+        200
+      ]
+    }
+  ],
+  "connections": {
+    "Daily Update Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Knowledge Directory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Knowledge Directory": {
+      "main": [
+        [
+          {
+            "node": "Process Knowledge Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Knowledge Files": {
+      "main": [
+        [
+          {
+            "node": "Batch Knowledge Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batch Knowledge Items": {
+      "main": [
+        [
+          {
+            "node": "Update Knowledge Base",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Knowledge Base": {
+      "main": [
+        [
+          {
+            "node": "Rate Limit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rate Limit": {
+      "main": [
+        [
+          {
+            "node": "All Items Processed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "All Items Processed?": {
+      "main": [
+        [
+          {
+            "node": "Generate Report",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Batch Knowledge Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Report": {
+      "main": [
+        [
+          {
+            "node": "Send Report Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+} 

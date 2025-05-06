@@ -1,0 +1,231 @@
+{
+  "name": "Outbound Call Workflow",
+  "nodes": [
+    {
+      "parameters": {},
+      "name": "Start",
+      "type": "n8n-nodes-base.start",
+      "typeVersion": 1,
+      "position": [
+        250,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1-5"
+            }
+          ]
+        }
+      },
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        450,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/api/leads",
+        "options": {}
+      },
+      "name": "Get Sales Leads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        650,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {
+          "reset": true
+        }
+      },
+      "name": "Loop Over Leads",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 2,
+      "position": [
+        850,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/api/outbound/call",
+        "method": "POST",
+        "options": {
+          "body": {
+            "to": "={{$json.phoneNumber}}",
+            "agentId": "={{$env.ELEVENLABS_AGENT_ID}}"
+          }
+        }
+      },
+      "name": "Start Outbound Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        1050,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 5,
+        "unit": "minutes"
+      },
+      "name": "Wait Between Calls",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [
+        1250,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$node[\"Loop Over Leads\"].context[\"noItemsLeft\"]}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "name": "All Leads Processed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        1450,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/api/campaigns/update",
+        "method": "POST",
+        "options": {
+          "body": {
+            "campaignId": "daily-outbound",
+            "status": "completed",
+            "timestamp": "={{$now}}"
+          }
+        }
+      },
+      "name": "Update Campaign Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        1650,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Log the campaign completion\nconsole.log('Outbound call campaign completed at:', new Date().toISOString());\n\n// Return a simple status object\nreturn [\n  {\n    json: {\n      success: true,\n      message: 'Outbound call campaign completed',\n      timestamp: new Date().toISOString()\n    }\n  }\n];"
+      },
+      "name": "Complete Campaign",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1850,
+        200
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Sales Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Sales Leads": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Leads": {
+      "main": [
+        [
+          {
+            "node": "Start Outbound Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start Outbound Call": {
+      "main": [
+        [
+          {
+            "node": "Wait Between Calls",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Between Calls": {
+      "main": [
+        [
+          {
+            "node": "All Leads Processed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "All Leads Processed?": {
+      "main": [
+        [
+          {
+            "node": "Update Campaign Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Over Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Campaign Status": {
+      "main": [
+        [
+          {
+            "node": "Complete Campaign",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+} 

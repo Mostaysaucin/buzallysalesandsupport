@@ -1,0 +1,570 @@
+const express = require('express');
+const router = express.Router();
+const twilio = require('twilio');
+const logger = require('../utils/logger');
+const elevenlabs = require('../utils/elevenlabsClient');
+const knowledgeBase = require('../utils/knowledgeBase');
+const VoiceResponse = twilio.twiml.VoiceResponse;
+const { redisClient, subscriberClient, sessionManager, redisConnectionOptions } = require('../utils/redisClient');
+const { dbService } = require('../utils/dbClient');
+const { v4: uuidv4 } = require('uuid'); // For generating session IDs and job IDs
+
+// Import handlers from the new elevenlabsHandlers module
+const { 
+  handleElevenLabsMessage,
+  handleElevenLabsError, 
+  handleElevenLabsClose,
+  handleElevenLabsReconnecting,
+  AUDIO_CHANNEL_PREFIX,
+  replayBufferedAudio
+} = require('../utils/elevenlabsHandlers');
+
+// Rate Limiting
+const rateLimit = require('express-rate-limit');
+// const RedisStore = require('rate-limit-redis'); // Standard require
+// const { RedisStore } = require('rate-limit-redis'); // Destructured require
+const rateLimitRedis = require('rate-limit-redis'); // Import the whole module
+const RedisStore = rateLimitRedis.RedisStore; // Access the property
+
+// Initialize Twilio client
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+
+// --- BullMQ Setup ---
+const { Queue } = require('bullmq');
+const QUEUE_NAME = 'outbound-calls';
+const outboundCallQueue = new Queue(QUEUE_NAME, {
+    connection: redisConnectionOptions,
+    defaultJobOptions: {
+        attempts: 3, // Retry failed jobs 3 times
+        backoff: { type: 'exponential', delay: 1000 } // Exponential backoff
+    }
+});
+logger.info(`Queue '${QUEUE_NAME}' initialized.`);
+// ---------------------
+
+// --- Rate Limiter Placeholder --- 
+// We will initialize this AFTER Redis connects
+let startCallLimiter = (req, res, next) => {
+    // Default to allow if not initialized (shouldn't happen in normal flow)
+    logger.warn('Rate limiter accessed before initialization!');
+    next(); 
+};
+// --------------------------------
+
+// --- WebSocket Setup (for Twilio Stream) ---
+// This needs to be integrated with the main Express app server instance
+// We'll define the logic here, but the WebSocket server needs to be attached
+// to the HTTP server created in server.js
+
+const WebSocket = require('ws');
+
+// Define Redis Pub/Sub channel prefix - use the one from elevenlabsHandlers
+// const AUDIO_CHANNEL_PREFIX = 'twilio-audio:';
+
+const serverAudioBuffers = new Map(); // sessionId -> array of payload strings
+const MAX_SERVER_BUFFER_SIZE = 20; // limit buffered chunks per session
+
+function setupWebSocketServer(httpServer) {
+  // Match any path starting with /api/outbound/stream/
+  // Ensure this path doesn't conflict with other WebSocket paths
+  const wss = new WebSocket.Server({
+       noServer: true, // We'll handle upgrade manually for path matching
+       clientTracking: true // Keep track of clients for broadcasting/targeting if needed (though Pub/Sub is better)
+  });
+
+  // Handle HTTP upgrade requests to filter for our specific path
+  httpServer.on('upgrade', (request, socket, head) => {
+    const pathname = require('url').parse(request.url).pathname;
+    if (pathname.startsWith('/api/outbound/stream/')) {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request); 
+      });
+    } else {
+      // Close connections trying to connect to other paths on this endpoint
+      // Or pass to another WebSocket server if you have multiple
+      logger.warn(`WebSocket connection attempt rejected for path: ${pathname}`);
+      socket.destroy();
+    }
+  });
+
+
+  // Store active subscriptions for cleanup: Map<sessionId, Function>
+  const activeSubscriptions = new Map();
+
+  wss.on('connection', async (ws, req) => { // Make handler async
+    logger.info(`>>> WebSocket connection event fired. Original URL: ${req.url}`);
+    // Extract session ID from the PATH
+    let sessionId; // This sessionId corresponds to the ElevenLabs session
+    try {
+      const url = require('url');
+      const parsedPath = url.parse(req.url).pathname;
+      const pathParts = parsedPath.split('/');
+      // Expecting /api/outbound/stream/SESSION_ID
+      if (pathParts.length === 5 && pathParts[1] === 'api' && pathParts[2] === 'outbound' && pathParts[3] === 'stream') {
+           sessionId = pathParts[4];
+      }
+    } catch (err) {
+      logger.error('Error parsing WebSocket request URL path:', err);
+    }
+
+    if (!sessionId) {
+      logger.error('Session ID not found in WebSocket connection URL. Closing.');
+      ws.close(1008, 'Session ID missing');
+      return;
+    }
+    
+    // Prefix log messages in this handler with the session ID
+    const logPrefix = `[${sessionId}]`; 
+    logger.info(`${logPrefix} Twilio stream attempting connection.`);
+    
+    // --- PHASE 3: Get Call Info ONLY from Redis --- 
+    let callInfo = await sessionManager.getOutboundSession(sessionId);
+    // --- Remove global fallback --- 
+
+    if (!callInfo) { // Check Redis result directly
+        logger.error(`${logPrefix} No active call found in Redis for this session ID. Closing Twilio connection.`);
+        ws.close(1011, 'Session not found in Redis');
+        return;
+    }
+
+    // *** Enhanced session detection and acquisition logic ***
+    const elevenLabsStatus = elevenlabs.getSessionStatus(sessionId);
+    
+    // If the session is not active in this process, try to check and acquire it
+    if (!elevenlabs.isSessionActiveOrOpening(sessionId)) {
+        logger.info(`${logPrefix} ElevenLabs session not active in server process. Checking if it exists elsewhere...`);
+        
+        // Check if the session exists in any process via Redis
+        const sessionInfo = await elevenlabs.sessionExistsAnywhere(sessionId);
+        
+        if (!sessionInfo.exists) {
+            logger.error(`${logPrefix} ElevenLabs session (${sessionId}) is inactive and not found in Redis. Cannot connect Twilio stream. Closing.`);
+            // Clean up Redis state if call shouldn't be active
+       await sessionManager.deleteOutboundSession(sessionId);
+       ws.close(1011, 'ElevenLabs session inactive or closed');
+       return;
+        } 
+        
+        // Try to acquire ownership of the session if it exists elsewhere
+        if (sessionInfo.owner && sessionInfo.owner !== process.pid) {
+            logger.info(`${logPrefix} ElevenLabs session owned by process ${sessionInfo.owner}. Attempting to coordinate...`);
+            
+            // Update Redis to indicate the server is handling this WebSocket
+            await sessionManager.saveOutboundSession(sessionId, {
+                ...callInfo,
+                serverHandling: process.pid,
+                serverHandlingTime: Date.now(),
+                previousServerPid: callInfo.serverHandling || null,
+                workerOwner: sessionInfo.owner
+            });
+            
+            // Notify the user of the coordination attempt
+            logger.info(`${logPrefix} Updated Redis to indicate server process ${process.pid} is handling WebSocket for session owned by worker ${sessionInfo.owner}`);
+            
+            // Wait a moment for the other process to respond if necessary
+            await new Promise(resolve => setTimeout(resolve, 500));
+            
+            // Re-fetch call info after coordination
+            callInfo = await sessionManager.getOutboundSession(sessionId);
+            if (!callInfo) {
+                logger.error(`${logPrefix} Session data lost during coordination. Closing connection.`);
+                ws.close(1011, 'Session data lost during coordination');
+                return;
+            }
+        }
+    } else if (elevenLabsStatus !== 'OPEN') {
+        logger.warn(`${logPrefix} ElevenLabs session (${sessionId}) is not OPEN (Status: ${elevenLabsStatus}). Twilio stream connecting, but issues might occur.`);
+    } else {
+        logger.info(`${logPrefix} ElevenLabs session (${sessionId}) is OPEN in this process. Direct routing will be used.`);
+    }
+
+    logger.info(`${logPrefix} Twilio stream connected. Attaching handlers. Call SID: ${callInfo.callSid}`);
+
+    // Attach session info directly to the WebSocket object for this connection's scope
+    ws.sessionId = sessionId;
+    ws.callInfo = callInfo; // Initial call info
+
+    // --- Subscribe to Redis Pub/Sub channel for this session ---
+    const audioChannel = `${AUDIO_CHANNEL_PREFIX}${sessionId}`;
+    const messageHandler = (message, channel) => {
+        if (channel === audioChannel) {
+            // Received audio from ElevenLabs via Redis Pub/Sub
+            try {
+                 const data = JSON.parse(message);
+                 if (data.audioBase64 && ws.readyState === WebSocket.OPEN && ws.callInfo?.streamSid) {
+                      // Format audio payload for Twilio Media API
+                      // Ensure consistent audio format (µ-law 8kHz)
+                      const twilioMediaMessage = {
+                          event: 'media',
+                          streamSid: ws.callInfo.streamSid, // Use potentially updated streamSid
+                          media: { 
+                              payload: data.audioBase64,
+                              track: data.track || 'outbound', // Use provided track or default to outbound
+                              contentType: 'audio/x-mulaw' // Explicitly set to proper MIME type
+                          },
+                      };
+                      
+                      // Log detailed info about the audio being sent
+                      logger.info(`${logPrefix} Sending ElevenLabs audio to Twilio, source: ${data.source || 'unknown'}, ` +
+                                  `length: ${data.audioBase64.length}, format: ${data.format || 'unknown'}, ` +
+                                  `sampleRate: ${data.sampleRate || 'unknown'}, sequence: ${data.sequenceNumber || 'unknown'}`);
+                      
+                      ws.send(JSON.stringify(twilioMediaMessage));
+                 } else if (!ws.callInfo?.streamSid) {
+                     // Buffer audio until streamSid is available
+                     if (!serverAudioBuffers.has(sessionId)) {
+                         serverAudioBuffers.set(sessionId, []);
+                     }
+                     const buf = serverAudioBuffers.get(sessionId);
+                     
+                     // Store the complete data object to preserve metadata
+                     buf.push(data);
+                     
+                     // Limit buffer size to avoid memory bloat
+                     if (buf.length > MAX_SERVER_BUFFER_SIZE) {
+                         buf.shift();
+                     }
+                     logger.info(`${logPrefix} Buffered audio chunk (${data.source || 'unknown'}) because streamSid not yet set. Buffer length: ${buf.length}`);
+                 } else if (ws.readyState !== WebSocket.OPEN) {
+                      logger.warn(`${logPrefix} Received audio via Pub/Sub, but WebSocket is not open (state: ${ws.readyState}). Discarding.`);
+                 } else {
+                      logger.warn(`${logPrefix} Received message from Redis but audioBase64 missing. Message keys: ${Object.keys(data).join(', ')}`);
+                 }
+            } catch (err) {
+                 logger.error(`${logPrefix} Error processing message from Redis Pub/Sub channel ${channel}:`, err);
+            }
+        }
+    };
+
+    // Subscribe using the dedicated subscriber client
+    await subscriberClient.subscribe(audioChannel, messageHandler);
+    activeSubscriptions.set(sessionId, messageHandler); // Store handler reference for unsubscribe
+    logger.info(`${logPrefix} Subscribed to Redis channel: ${audioChannel}`);
+    // -----------------------------------------------------------
+
+    ws.on('message', async (message) => { // Make handler async
+      const msg = JSON.parse(message);
+
+      // Use session info attached to this specific WebSocket connection
+      const currentSessionId = ws.sessionId;
+      // Refresh call info from Redis in case streamSid was added
+      let currentCallInfo = await sessionManager.getOutboundSession(currentSessionId);
+
+      if (!currentCallInfo) {
+          logger.error(`${logPrefix} Call info for ${currentSessionId} lost during WebSocket message handling (Redis lookup failed). Ignoring message.`);
+          // No need to close ws here, wait for 'close' or 'error' event
+          return;
+      }
+       // Update the ws object's reference if needed
+      ws.callInfo = currentCallInfo; 
+
+      switch (msg.event) {
+        case 'connected':
+          logger.info(`${logPrefix} Twilio stream connected event.`);
+          break;
+        case 'start':
+          logger.info(`${logPrefix} Twilio stream start event.`);
+          // Capture streamSid from event and update Redis
+          if (msg.streamSid) {
+            logger.info(`${logPrefix} Storing streamSid ${msg.streamSid}`);
+            currentCallInfo.streamSid = msg.streamSid;
+            await sessionManager.saveOutboundSession(currentSessionId, currentCallInfo); // Persist updated info
+            ws.callInfo = currentCallInfo; // Update ws reference
+            
+            // NEW: Replay any buffered audio now that streamSid is available
+            await replayBufferedAudio(currentSessionId, currentCallInfo);
+            logger.info(`${logPrefix} Checked for buffered audio to replay after streamSid was set`);
+
+            // Replay any audio buffered on the server side (before streamSid)
+            if (serverAudioBuffers.has(currentSessionId) && serverAudioBuffers.get(currentSessionId).length > 0) {
+                const buffered = serverAudioBuffers.get(currentSessionId);
+                logger.info(`${logPrefix} Replaying ${buffered.length} buffered audio chunks now that streamSid is set.`);
+                
+                // Sort buffered chunks by sequence number if available
+                if (buffered.length > 1 && buffered[0].sequenceNumber !== undefined) {
+                    buffered.sort((a, b) => (a.sequenceNumber || 0) - (b.sequenceNumber || 0));
+                    logger.info(`${logPrefix} Sorted buffered audio by sequence numbers to ensure proper ordering.`);
+                }
+                
+                for (const audioData of buffered) {
+                    const twilioMediaMessage = {
+                        event: 'media',
+                        streamSid: msg.streamSid,
+                        media: { 
+                            payload: audioData.audioBase64,
+                            track: audioData.track || 'outbound',
+                            contentType: 'audio/x-mulaw' // Explicitly set to proper MIME type
+                        },
+                    };
+                    
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify(twilioMediaMessage));
+                        
+                        // Log detailed playback info
+                        logger.info(`${logPrefix} Replayed buffered audio chunk: source=${audioData.source || 'unknown'}, ` +
+                                   `format=${audioData.format || 'unknown'}, sequence=${audioData.sequenceNumber || 'unknown'}`);
+                        
+                        // Small delay between chunks to prevent flooding
+                        await new Promise(resolve => setTimeout(resolve, 50));
+                    }
+                }
+                serverAudioBuffers.delete(currentSessionId);
+            }
+          }
+          break;
+        case 'media':
+          // If streamSid was never captured via 'start', capture it from media message
+          if (!currentCallInfo.streamSid && msg.streamSid) {
+            logger.warn(`${logPrefix} streamSid missing but present in media message. Capturing streamSid ${msg.streamSid} now.`);
+            currentCallInfo.streamSid = msg.streamSid;
+            await sessionManager.saveOutboundSession(currentSessionId, currentCallInfo);
+            ws.callInfo = currentCallInfo;
+            // Replay buffered audio from server-side buffer, if any
+            if (serverAudioBuffers.has(currentSessionId) && serverAudioBuffers.get(currentSessionId).length > 0) {
+                const buffered = serverAudioBuffers.get(currentSessionId);
+                logger.info(`${logPrefix} Replaying ${buffered.length} buffered chunks after capturing streamSid from media.`);
+                for (const payload of buffered) {
+                    const mediaMsg = { 
+                        event: 'media', 
+                        streamSid: msg.streamSid, 
+                        media: { 
+                            payload: payload.audioBase64,
+                            track: 'outbound',
+                            contentType: 'audio/x-mulaw'
+                        } 
+                    };
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify(mediaMsg));
+                    }
+                }
+                serverAudioBuffers.delete(currentSessionId);
+            }
+          }
+          // Forward audio chunk from Twilio to ElevenLabs, checking status
+          const currentElevenLabsStatus = elevenlabs.getSessionStatus(currentSessionId);
+          // Use a helper that checks OPEN or RECONNECTING (might buffer during reconnect)
+          if (elevenlabs.isSessionActiveOrReconnecting(currentSessionId)) {
+            elevenlabs.sendAudioChunk(currentSessionId, msg.media.payload); // payload is base64 audio
+          } else {
+            // Check if this session exists in another process via Redis
+            const sessionInfo = await elevenlabs.sessionExistsAnywhere(currentSessionId);
+            
+            if (sessionInfo.exists && sessionInfo.owner && sessionInfo.owner !== process.pid) {
+              logger.info(`${logPrefix} ElevenLabs session not active locally but exists in process ${sessionInfo.owner}. Publishing audio to Redis.`);
+              
+              // Publish audio directly to Redis for the worker process to consume
+              const audioChannel = `twilio-to-elevenlabs:${currentSessionId}`;
+              try {
+                await redisClient.publish(audioChannel, JSON.stringify({
+                  audioBase64: msg.media.payload,
+                  sourceProcess: process.pid,
+                  timestamp: Date.now()
+                }));
+                logger.debug(`${logPrefix} Published Twilio audio to Redis for worker process ${sessionInfo.owner}`);
+              } catch (pubError) {
+                logger.error(`${logPrefix} Error publishing Twilio audio to Redis:`, pubError);
+              }
+            } else {
+              logger.warn(`${logPrefix} ElevenLabs session ${currentSessionId} not active/reconnecting (Status: ${currentElevenLabsStatus}), discarding Twilio audio.`);
+            }
+          }
+          break;
+        case 'stop':
+          logger.info(`${logPrefix} Twilio stream stop event.`);
+          // The 'close' event will handle cleanup
+          break;
+        case 'closed':
+            logger.info(`${logPrefix} Twilio stream received explicit closed event.`);
+            // The 'close' event will handle cleanup
+            break;
+        default:
+             logger.warn(`${logPrefix} Received unknown Twilio stream event type: ${msg.event}`);
+             break;
+      }
+    });
+
+    ws.on('error', async (err) => { // Make handler async
+      // Use attached sessionId if available
+      const errorSessionId = ws.sessionId || 'unknown';
+      const errorLogPrefix = `[${errorSessionId}]`; 
+      logger.error(`${errorLogPrefix} Twilio stream error:`, err.message);
+
+       if (errorSessionId !== 'unknown') {
+           logger.info(`${errorLogPrefix} Ending ElevenLabs conversation due to Twilio stream error.`);
+           elevenlabs.endConversation(errorSessionId); // Ensure ElevenLabs session is cleaned up
+
+            // --- Unsubscribe from Redis Pub/Sub ---
+            const handler = activeSubscriptions.get(errorSessionId);
+            if (handler) {
+                try {
+                    await subscriberClient.unsubscribe(`${AUDIO_CHANNEL_PREFIX}${errorSessionId}`, handler);
+                    activeSubscriptions.delete(errorSessionId);
+                    logger.info(`${errorLogPrefix} Unsubscribed from Redis channel due to error.`);
+                } catch (unsubError) {
+                    logger.error(`${errorLogPrefix} Error unsubscribing from Redis on WS error:`, unsubError);
+                }
+            }
+            // -------------------------------------
+
+           try {
+             // Update Redis status, keep record for debugging maybe
+             await sessionManager.saveOutboundSession(errorSessionId, { status: 'error', error: `Twilio stream error: ${err.message}` }, 3600);
+           } catch (redisError) {
+                logger.error(`${errorLogPrefix} Failed to update Redis status on Twilio stream error:`, redisError);
+           }
+       }
+       // Ensure WebSocket is closed locally
+       if (ws.readyState !== WebSocket.CLOSED && ws.readyState !== WebSocket.CLOSING) {
+           ws.terminate();
+       }
+    });
+
+    ws.on('close', async (code, reason) => { // Make handler async
+       // Use attached sessionId if available
+       const closeSessionId = ws.sessionId || 'unknown';
+       const closeLogPrefix = `[${closeSessionId}]`;
+       const reasonStr = reason?.toString() || 'No reason given';
+       logger.info(`${closeLogPrefix} Twilio stream connection closed. Code: ${code}, Reason: ${reasonStr}`);
+
+       if (closeSessionId !== 'unknown') {
+           logger.info(`${closeLogPrefix} Ending ElevenLabs conversation due to Twilio stream close.`);
+           elevenlabs.endConversation(closeSessionId); // *** Crucial: Ensure ElevenLabs session is cleaned up ***
+
+            // --- Unsubscribe from Redis Pub/Sub ---
+            const handler = activeSubscriptions.get(closeSessionId);
+            if (handler) {
+                try {
+                    await subscriberClient.unsubscribe(`${AUDIO_CHANNEL_PREFIX}${closeSessionId}`, handler);
+                    activeSubscriptions.delete(closeSessionId);
+                    logger.info(`${closeLogPrefix} Unsubscribed from Redis channel.`);
+                } catch (unsubError) {
+                     logger.error(`${closeLogPrefix} Error unsubscribing from Redis on WS close:`, unsubError);
+                }
+            }
+            // -------------------------------------
+
+           // Optionally update Redis status if it wasn't already 'disconnected' or 'error'
+           try {
+                // Update status, maybe keep record briefly
+                await sessionManager.saveOutboundSession(closeSessionId, { 
+                  status: 'disconnected', 
+                  closeCode: code, 
+                  closeReason: reasonStr,
+                  ownerProcess: null // Clear ownership
+                }, 3600);
+            } catch (redisError) {
+                logger.error(`${closeLogPrefix} Failed to update Redis status on Twilio stream close:`, redisError);
+            }
+       }
+    });
+  });
+
+  return wss;
+}
+
+// --- MODIFIED /start route --- 
+// Use the startCallLimiter variable which will be updated later
+router.post('/start', (req, res, next) => startCallLimiter(req, res, next), async (req, res) => {
+    const { to, from, n8nWorkflowUrl } = req.body;
+
+  if (!to || !from) {
+        logger.warn('Missing required parameters for /start endpoint.');
+    return res.status(400).json({ error: 'Missing required parameters: to, from' });
+  }
+
+    try {
+        const jobId = uuidv4(); // Generate a unique ID for the job
+        const jobData = { 
+            to,
+            from,
+            n8nWorkflowUrl: n8nWorkflowUrl || null,
+            jobId // Pass jobId to worker for logging/tracking
+         };
+
+        // Add job to the queue
+        await outboundCallQueue.add('initiate-call', jobData, {
+            jobId: jobId // Use custom jobId for potential tracking
+    });
+
+        logger.info(`[API][Job ${jobId}] Added call initiation job to queue for ${to} from ${from}`);
+
+        // Respond immediately to the client
+        res.status(202).json({ 
+            message: 'Call initiation request accepted and queued.', 
+            jobId: jobId // Return jobId so client can potentially track status
+    });
+
+  } catch (error) {
+        logger.error(`[API] Error adding call initiation job to queue for ${to}:`, error);
+        res.status(500).json({ error: 'Failed to queue call initiation request.', details: error.message });
+  }
+});
+// --- End of MODIFIED /start route ---
+
+// Status Callback Endpoint (Receives updates from Twilio about the call)
+// Consider adding rate limiting here too if needed
+router.post('/status/:sessionId', async (req, res) => {
+  const sessionId = req.params.sessionId;
+    const { CallSid, CallStatus, CallDuration, ErrorCode, ErrorMessage } = req.body;
+    const logPrefix = `[${sessionId}/${CallSid}]`;
+
+    logger.info(`${logPrefix} Received Twilio Status Callback: ${CallStatus}`);
+
+    try {
+        // --- PHASE 3: Update Redis ONLY ---
+  let callInfo = await sessionManager.getOutboundSession(sessionId);
+
+  if (!callInfo) {
+            logger.error(`${logPrefix} Cannot find session data in Redis for status update. Ignoring.`);
+            // Respond 200 to Twilio anyway to acknowledge receipt
+            return res.sendStatus(200);
+        }
+
+        // Update status and potentially other fields
+        callInfo.status = CallStatus;
+        callInfo.duration = CallDuration;
+        if (ErrorCode) callInfo.errorCode = ErrorCode;
+        if (ErrorMessage) callInfo.errorMessage = ErrorMessage;
+
+        // Decide on TTL based on status - maybe keep completed/failed calls longer?
+        let ttl = 3600; // Default 1 hour
+        if (['completed', 'failed', 'canceled', 'busy', 'no-answer'].includes(CallStatus)) {
+            ttl = 24 * 3600; // Keep final states for 24 hours in Redis
+            // End ElevenLabs session if the call ends definitively
+             logger.info(`${logPrefix} Call ended (${CallStatus}). Ensuring ElevenLabs session is terminated.`);
+             await elevenlabs.endConversation(sessionId);
+        }
+
+        await sessionManager.saveOutboundSession(sessionId, callInfo, ttl);
+   // --- Remove global update ---
+
+        // --- Phase 3: Update DB using callSid (No change needed here) ---
+  const callRecord = await dbService.getCallByExternalId(CallSid);
+  if (callRecord) {
+      const updateData = { 
+          status: CallStatus, 
+                duration: CallDuration ? parseInt(CallDuration, 10) : null,
+            };
+            // Set end time only for final states
+            if (['completed', 'failed', 'canceled', 'busy', 'no-answer'].includes(CallStatus)) {
+                updateData.end_time = new Date();
+                if (ErrorCode) updateData.failure_reason = `Twilio Error ${ErrorCode}: ${ErrorMessage || 'Unknown'}`;
+      }
+      await dbService.updateCall(callRecord.id, updateData);
+             logger.info(`${logPrefix} Updated DB record status to ${CallStatus}.`);
+  } else {
+            logger.warn(`${logPrefix} Could not find DB record for CallSid ${CallSid} during status update.`);
+            // Consider creating a record here if it should always exist
+  }
+        // --- End Phase 3 ---
+
+        res.sendStatus(200); // Acknowledge receipt to Twilio
+    
+      } catch (error) {
+         logger.error(`${logPrefix} Error processing Twilio status callback:`, error);
+         res.status(500).send('Error processing status update');
+     }
+});

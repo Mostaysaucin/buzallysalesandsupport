@@ -1,0 +1,896 @@
+const axios = require('axios');
+const WebSocket = require('ws');
+const logger = require('./logger');
+const EventEmitter = require('events');
+
+// Constants for reconnection and heartbeat
+const RECONNECT_BASE_DELAY_MS = 1000; // 1 second
+const RECONNECT_MAX_DELAY_MS = 30000; // 30 seconds
+const RECONNECT_FACTOR = 2;
+const RECONNECT_MAX_ATTEMPTS = 10; // Or null for infinite
+const HEARTBEAT_INTERVAL_MS = 15000; // 15 seconds
+const PONG_TIMEOUT_MS = 5000; // 5 seconds
+
+// Store active WebSocket connections and associated data
+// Map structure: sessionId -> { ws, agentId, status, callbacks, reconnectTimer, heartbeatTimer, pongTimeoutTimer, reconnectAttempts }
+const activeSessions = new Map();
+
+/**
+ * ElevenLabs API client using WebSockets for Conversational AI.
+ * Emits events: 'open', 'message', 'error', 'close', 'reconnecting', 'reconnected', 'permanently_closed'
+ */
+class ElevenLabsWebSocketClient extends EventEmitter {
+  constructor() {
+    super(); // Call EventEmitter constructor
+    this.apiKey = process.env.ELEVENLABS_API_KEY;
+    this.agentId = process.env.ELEVENLABS_AGENT_ID;
+    // Note: Voice ID might be configured within the agent settings
+    
+    // Add default error handler to prevent process crashes on unhandled errors
+    this.on('error', (sessionId, error) => {
+      logger.error(`Default error handler: Unhandled error for session ${sessionId}:`, error);
+      // This prevents Node.js from crashing due to unhandled 'error' events
+    });
+  }
+
+  /**
+   * Start a WebSocket conversation session. Returns sessionId immediately.
+   * Listen for events ('open', 'message', 'error', 'close', etc.) on the client instance.
+   * @param {string} [agentId] - Agent ID (defaults to environment variable)
+   * @param {Function} onMessageCallback - Function to call when a message (transcript, agent response) is received
+   * @param {Function} [onErrorCallback] - Optional: Function to call on non-fatal WebSocket error
+   * @param {Function} [onCloseCallback] - Optional: Function to call when WebSocket closes definitively
+   * @param {Function} [onReconnectingCallback] - Optional: Function to call when attempting to reconnect
+   * @returns {string} - The unique session ID
+   */
+  async startConversation(
+    agentId = this.agentId,
+    onMessageCallback,
+    onErrorCallback, // Keep callbacks for potential specific logging/handling
+    onCloseCallback,
+    onReconnectingCallback
+  ) {
+    const wsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${agentId}`;
+    const sessionId = `session_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+
+    logger.info(`[${sessionId}] Attempting to start WebSocket connection for agent ${agentId}`);
+
+    const sessionData = {
+      ws: null,
+      agentId: agentId,
+      status: 'CONNECTING',
+      callbacks: { // Store callbacks
+        onMessage: onMessageCallback,
+        onError: onErrorCallback,
+        onClose: onCloseCallback,
+        onReconnecting: onReconnectingCallback,
+      },
+      reconnectTimer: null,
+      heartbeatTimer: null,
+      pongTimeoutTimer: null,
+      reconnectAttempts: 0,
+      wsUrl: wsUrl, // Store URL for reconnections
+      processId: process.pid // Store the process ID that created this session
+    };
+    activeSessions.set(sessionId, sessionData);
+
+    // Attempt to acquire session ownership in Redis
+    try {
+      const { sessionManager } = require('./redisClient');
+      const acquired = await sessionManager.acquireSessionOwnership(sessionId, process.pid);
+      if (!acquired) {
+        logger.warn(`[${sessionId}] Failed to acquire session ownership in Redis, but continuing with connection attempt.`);
+      } else {
+        logger.debug(`[${sessionId}] Successfully acquired session ownership in Redis.`);
+      }
+    } catch (error) {
+      logger.error(`[${sessionId}] Error acquiring session ownership:`, error);
+      // Continue anyway, this is non-fatal
+    }
+
+    this._connect(sessionId); // Initiate the first connection attempt
+
+    return sessionId; // Return session ID immediately
+  }
+
+  _connect(sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (!session || session.status === 'CLOSING' || session.status === 'CLOSED') {
+      logger.warn(`[${sessionId}] Connection attempt aborted, session is closing or closed.`);
+      return;
+    }
+
+    logger.info(`[${sessionId}] Connecting... (Attempt ${session.reconnectAttempts + 1})`);
+    session.status = 'CONNECTING';
+    // Clear any previous timers just in case
+    this._clearTimers(sessionId);
+
+    const ws = new WebSocket(session.wsUrl, {
+      headers: {
+        'xi-api-key': this.apiKey,
+      },
+    });
+
+    session.ws = ws; // Store the WebSocket instance
+
+    ws.on('open', () => {
+      logger.info(`[${sessionId}] WebSocket connection opened.`);
+      session.status = 'OPEN';
+      session.reconnectAttempts = 0; // Reset attempts on successful connection
+      this._clearReconnectTimer(sessionId); // Clear any pending reconnect timer
+
+      // Send conversation_initiation with EXPLICIT audio format compatible with Twilio
+      const initMessage = {
+        type: 'conversation_initiation',
+        conversation_initiation_event: {
+          audio_format: "mulaw",    // Use mulaw
+          sample_rate_hz: 8000,     // Explicitly request 8kHz to match Twilio
+          encoding: "audio/x-mulaw" // Use standard MIME type
+        }
+      };
+      ws.send(JSON.stringify(initMessage));
+      logger.info(`[${sessionId}] Sent conversation_initiation with explicit audio_format=mulaw, sample_rate_hz=8000, and encoding=audio/x-mulaw`);
+
+      this._startHeartbeat(sessionId); // Start heartbeat mechanism
+
+      // Update Redis ownership with new TTL
+      this._refreshOwnership(sessionId);
+
+      // Emit 'open' or 'reconnected' event
+      const eventName = session.reconnectAttempts === 0 ? 'open' : 'reconnected';
+      this.emit(eventName, sessionId);
+    });
+
+    ws.on('message', (data) => {
+      // Any message indicates the connection is alive
+      this._resetHeartbeatTimers(sessionId);
+
+      try {
+        const message = JSON.parse(data.toString());
+        // logger.debug(`[${sessionId}] Received message:`, message);
+
+        if (message.type === 'ping') {
+          this.sendMessage(sessionId, {
+            type: 'pong',
+            event_id: message.ping_event.event_id,
+          });
+        } else if (message.type === 'pong') {
+          // Pong received, clear the timeout timer
+          this._clearPongTimeoutTimer(sessionId);
+        } else if (session.callbacks.onMessage) {
+          // Pass other messages to the provided callback
+          session.callbacks.onMessage(sessionId, message);
+          this.emit('message', sessionId, message); // Also emit generically
+        }
+      } catch (e) {
+        logger.error(`[${sessionId}] Error parsing message:`, e);
+        logger.error('[${sessionId}] Raw message data:', data.toString());
+      }
+    });
+
+    ws.on('error', (error) => {
+      logger.error(`[${sessionId}] WebSocket error:`, error.message);
+      session.status = 'ERROR'; // Intermediate state before reconnecting/closed
+      if (session.callbacks.onError) {
+        session.callbacks.onError(sessionId, error);
+      }
+      this.emit('error', sessionId, error); // Emit error
+
+      // Treat error as a trigger for reconnection
+      this._handleDisconnect(sessionId, false); // false indicates not a clean close
+    });
+
+    ws.on('close', (code, reason) => {
+      logger.info(`[${sessionId}] WebSocket connection closed. Code: ${code}, Reason: ${reason?.toString()}`);
+      session.status = 'CLOSED_TEMP'; // Intermediate state
+
+      // Determine if closure was expected/clean
+      const isCleanClose = (code === 1000 || code === 1005); // 1000 = Normal, 1005 = No Status Received (often expected)
+
+      this._handleDisconnect(sessionId, isCleanClose);
+    });
+  }
+
+  _handleDisconnect(sessionId, isCleanClose) {
+      const session = activeSessions.get(sessionId);
+      if (!session || session.status === 'CLOSING' || session.status === 'CLOSED') {
+          logger.debug(`[${sessionId}] Disconnect handling skipped, session already closing/closed.`);
+          return;
+      }
+
+      this._stopHeartbeat(sessionId); // Stop heartbeats
+
+      if (isCleanClose || session.status === 'CLOSING') {
+          logger.info(`[${sessionId}] Clean close or explicit termination. Not reconnecting.`);
+          session.status = 'CLOSED';
+          this.emit('close', sessionId, 1000, "Clean closure"); // Emit standard close
+          if (session.callbacks.onClose) {
+              session.callbacks.onClose(sessionId, 1000, "Clean closure");
+          }
+          this._cleanupSession(sessionId);
+      } else {
+          // Unexpected close or error, attempt reconnection
+          this._scheduleReconnect(sessionId);
+      }
+  }
+
+
+  _scheduleReconnect(sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (!session || session.status === 'CLOSING' || session.status === 'CLOSED') {
+      logger.warn(`[${sessionId}] Reconnect scheduling aborted, session is closing or closed.`);
+      return;
+    }
+
+    if (RECONNECT_MAX_ATTEMPTS !== null && session.reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
+      logger.error(`[${sessionId}] Max reconnection attempts (${RECONNECT_MAX_ATTEMPTS}) reached. Connection permanently closed.`);
+      session.status = 'CLOSED';
+      this.emit('permanently_closed', sessionId, 'Max reconnection attempts reached');
+       if (session.callbacks.onClose) { // Notify via close callback as well
+            session.callbacks.onClose(sessionId, 1011, 'Max reconnection attempts reached'); // 1011 = Internal Error
+       }
+      this._cleanupSession(sessionId);
+      return;
+    }
+
+    session.reconnectAttempts++;
+    session.status = 'RECONNECTING';
+
+    // Calculate delay with exponential backoff and jitter
+    const baseDelay = Math.min(RECONNECT_MAX_DELAY_MS, RECONNECT_BASE_DELAY_MS * Math.pow(RECONNECT_FACTOR, session.reconnectAttempts - 1));
+    const jitter = baseDelay * 0.2 * Math.random(); // Add +/- 10% jitter
+    const delay = Math.round(baseDelay + jitter);
+
+    logger.info(`[${sessionId}] Scheduling reconnection attempt ${session.reconnectAttempts} in ${delay}ms...`);
+
+    this.emit('reconnecting', sessionId, session.reconnectAttempts, delay);
+    if (session.callbacks.onReconnecting) {
+        session.callbacks.onReconnecting(sessionId, session.reconnectAttempts, delay);
+    }
+
+    this._clearReconnectTimer(sessionId); // Clear previous timer if any
+    session.reconnectTimer = setTimeout(() => {
+      if (session.status === 'RECONNECTING') { // Ensure status hasn't changed
+          this._connect(sessionId);
+      } else {
+           logger.warn(`[${sessionId}] Reconnect timer fired, but status is now ${session.status}. Aborting reconnect.`);
+      }
+    }, delay);
+  }
+
+  _startHeartbeat(sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (!session || session.status !== 'OPEN') return;
+
+    logger.debug(`[${sessionId}] Starting heartbeat mechanism.`);
+    this._clearTimers(sessionId); // Clear previous timers
+
+    session.heartbeatTimer = setInterval(() => {
+      if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+        logger.debug(`[${sessionId}] Sending ping.`);
+        session.ws.ping(() => {}); // Send WebSocket standard ping
+
+        // Refresh session ownership in Redis at each heartbeat
+        this._refreshOwnership(sessionId);
+        
+        // Check for termination requests from other processes
+        this._checkForTerminationRequests(sessionId);
+        
+        // Check for audio from server process
+        this._checkForTwilioAudio(sessionId);
+
+        // Set a timeout waiting for the pong (or any message)
+        this._clearPongTimeoutTimer(sessionId); // Clear previous pong timeout
+        session.pongTimeoutTimer = setTimeout(() => {
+          logger.warn(`[${sessionId}] Pong timeout! Connection assumed dead. Terminating.`);
+          if (session.ws) {
+            session.ws.terminate(); // Force close the connection
+          }
+          // The 'close' event handler will trigger reconnection logic
+        }, PONG_TIMEOUT_MS);
+      } else {
+        logger.warn(`[${sessionId}] Heartbeat interval: WebSocket not open. Skipping ping.`);
+         // If WS is not open during a heartbeat interval, something is wrong. Trigger reconnect.
+         // This handles cases where the state somehow didn't update correctly.
+         this._handleDisconnect(sessionId, false);
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+    
+    // Set up Redis subscription for audio from server process
+    this._setupTwilioAudioSubscription(sessionId);
+  }
+
+  _stopHeartbeat(sessionId) {
+    logger.debug(`[${sessionId}] Stopping heartbeat mechanism.`);
+    this._clearTimers(sessionId);
+  }
+
+  _resetHeartbeatTimers(sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (session && session.status === 'OPEN') {
+        // logger.debug(`[${sessionId}] Resetting heartbeat timers due to received message.`);
+        this._clearPongTimeoutTimer(sessionId); // Clear pong timeout as connection is alive
+        // We could also clear and restart the main heartbeat interval timer here,
+        // effectively making it an inactivity timer. For now, keep the fixed interval ping.
+        // clearInterval(session.heartbeatTimer);
+        // this._startHeartbeat(sessionId); // If restarting the interval
+    }
+  }
+
+  _clearPongTimeoutTimer(sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (session && session.pongTimeoutTimer) {
+      clearTimeout(session.pongTimeoutTimer);
+      session.pongTimeoutTimer = null;
+    }
+  }
+
+  _clearReconnectTimer(sessionId) {
+      const session = activeSessions.get(sessionId);
+      if (session && session.reconnectTimer) {
+          clearTimeout(session.reconnectTimer);
+          session.reconnectTimer = null;
+      }
+  }
+
+  _clearHeartbeatIntervalTimer(sessionId) {
+       const session = activeSessions.get(sessionId);
+       if (session && session.heartbeatTimer) {
+           clearInterval(session.heartbeatTimer);
+           session.heartbeatTimer = null;
+       }
+  }
+
+  _clearTimers(sessionId) {
+       this._clearHeartbeatIntervalTimer(sessionId);
+       this._clearPongTimeoutTimer(sessionId);
+       // Keep reconnect timer separate as it controls the reconnect loop itself
+  }
+
+  // New method to refresh Redis session ownership
+  async _refreshOwnership(sessionId) {
+    try {
+      const { sessionManager } = require('./redisClient');
+      const session = activeSessions.get(sessionId);
+      
+      if (session) {
+        // Try to update ownership TTL in Redis
+        await sessionManager.updateSessionOwnership(sessionId, process.pid);
+      }
+    } catch (error) {
+      logger.error(`[${sessionId}] Error refreshing session ownership in Redis:`, error);
+      // Continue anyway, this is non-fatal for the websocket
+    }
+  }
+
+  /**
+   * Send a message over the WebSocket connection for a given session
+   * @param {string} sessionId - The ID of the session
+   * @param {Object} message - The message object to send
+   */
+  sendMessage(sessionId, message) {
+    const session = activeSessions.get(sessionId);
+    // Only send if status is OPEN
+    if (session && session.ws && session.status === 'OPEN' && session.ws.readyState === WebSocket.OPEN) {
+      try {
+        const messageString = JSON.stringify(message);
+        // logger.debug(`[${sessionId}] Sending message:`, messageString);
+        session.ws.send(messageString);
+      } catch (e) {
+        logger.error(`[${sessionId}] Error serializing/sending message:`, e);
+      }
+    } else {
+      logger.warn(`[${sessionId}] Attempted to send message while status is ${session?.status} or WebSocket is not open. Message dropped.`);
+      // Optional: Implement buffering here if needed during RECONNECTING state
+    }
+  }
+  
+  /**
+   * Send user audio chunk over WebSocket
+   * @param {string} sessionId - The ID of the session
+   * @param {string} audioBase64 - Base64 encoded audio chunk
+   */
+  sendAudioChunk(sessionId, audioBase64) {
+      this.sendMessage(sessionId, {
+          user_audio_chunk: audioBase64
+      });
+  }
+  
+  /**
+   * Send user text input over WebSocket (if needed/supported)
+   * Note: Primary input is usually audio chunks
+   * @param {string} sessionId - The ID of the session
+   * @param {string} text - Text input
+   */
+  sendTextInput(sessionId, text) {
+      this.sendMessage(sessionId, {
+          type: 'user_text_input', // Type might vary based on API spec
+          text: text
+      });
+  }
+
+  /**
+   * End a specific conversation session
+   * @param {string} sessionId - The ID of the session to end
+   */
+  async endConversation(sessionId) {
+    const session = activeSessions.get(sessionId);
+    
+    // First check if this session exists in Redis but is owned by another process
+    if (!session) {
+      try {
+        const sessionInfo = await this.sessionExistsAnywhere(sessionId);
+        
+        if (sessionInfo.exists) {
+          logger.info(`[${sessionId}] Session doesn't exist locally but exists in Redis. Attempting to signal termination.`);
+          
+          // Get the current Redis data
+          const { sessionManager } = require('./redisClient');
+          const sessionData = await sessionManager.getOutboundSession(sessionId);
+          
+          if (sessionData) {
+            // Update Redis with termination flag that other process can detect
+            await sessionManager.saveOutboundSession(sessionId, {
+              ...sessionData,
+              status: 'terminating',
+              terminateRequested: true,
+              terminateRequestedBy: process.pid,
+              terminateRequestTime: Date.now()
+            });
+            
+            logger.info(`[${sessionId}] Signaled termination request through Redis for process ${sessionInfo.owner || 'unknown'}`);
+            return;
+          }
+        } else {
+          logger.warn(`Attempted to end non-existent session: ${sessionId}`);
+          return;
+        }
+      } catch (error) {
+        logger.error(`[${sessionId}] Error checking session existence for termination:`, error);
+      }
+    }
+    
+    if (session) {
+       logger.info(`[${sessionId}] Explicitly closing conversation.`);
+       session.status = 'CLOSING'; // Mark as intentionally closing
+       this._stopHeartbeat(sessionId);
+       this._clearReconnectTimer(sessionId); // Prevent reconnection attempts
+
+       // Release Redis ownership
+       try {
+         const { sessionManager } = require('./redisClient');
+         await sessionManager.releaseSessionOwnership(sessionId, process.pid);
+         logger.debug(`[${sessionId}] Released ownership in Redis.`);
+       } catch (error) {
+         logger.error(`[${sessionId}] Error releasing ownership in Redis:`, error);
+       }
+
+       if (session.ws) {
+           if (session.ws.readyState === WebSocket.OPEN || session.ws.readyState === WebSocket.CONNECTING) {
+               // Send a specific close message if the API requires one? Check API docs.
+               // this.sendMessage(sessionId, { type: 'terminate_session' });
+               session.ws.close(1000, 'Conversation ended by client');
+           } else {
+               logger.warn(`[${sessionId}] WebSocket already closing or closed when endConversation called.`);
+               // Ensure cleanup still happens if WS is in a weird state
+                this._handleDisconnect(sessionId, true); // Treat as clean close for cleanup
+           }
+       } else {
+            logger.warn(`[${sessionId}] No WebSocket instance found during endConversation. Cleaning up.`);
+            // Ensure cleanup if WS never connected or was already gone
+            this._handleDisconnect(sessionId, true); // Treat as clean close for cleanup
+       }
+    } else {
+        logger.warn(`Attempted to end non-existent session: ${sessionId}`);
+    }
+    // Note: _handleDisconnect (called by 'close' event or directly above) now handles _cleanupSession
+  }
+
+  /**
+   * Clean up session data from the map
+   * @param {string} sessionId - The ID of the session to clean up
+   */
+  _cleanupSession(sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (session) {
+      this._clearTimers(sessionId);
+      this._clearReconnectTimer(sessionId);
+      // Ensure WS listeners are removed if WS object exists (prevent memory leaks)
+      if(session.ws) {
+          session.ws.removeAllListeners();
+      }
+      activeSessions.delete(sessionId);
+      logger.info(`[${sessionId}] Cleaned up session data.`);
+    }
+  }
+  
+  /**
+   * Check if a session is active
+   * @param {string} sessionId - The session ID to check
+   * @returns {boolean} - True if session exists and status is OPEN
+   */
+  isSessionActive(sessionId) {
+    const session = activeSessions.get(sessionId);
+    return session && session.status === 'OPEN';
+  }
+
+  /**
+   * Check if a session is active, connecting, or reconnecting
+   * @param {string} sessionId - The session ID to check
+   * @returns {boolean} - True if session exists and status is OPEN, CONNECTING, or RECONNECTING
+   */
+  isSessionActiveOrOpening(sessionId) {
+    const session = activeSessions.get(sessionId);
+    return session && ['OPEN', 'CONNECTING', 'RECONNECTING'].includes(session.status);
+  }
+
+  /**
+   * Check if a session is active or reconnecting (but not initial connecting)
+   * @param {string} sessionId - The session ID to check
+   * @returns {boolean} - True if session exists and status is OPEN or RECONNECTING
+   */
+  isSessionActiveOrReconnecting(sessionId) {
+    const session = activeSessions.get(sessionId);
+    return session && ['OPEN', 'RECONNECTING'].includes(session.status);
+  }
+
+  /**
+  * Get the current status of a session
+   * @param {string} sessionId - The session ID
+   * @returns {string|null} - The session status or null if not found
+  */
+  getSessionStatus(sessionId) {
+      const session = activeSessions.get(sessionId);
+      return session ? session.status : null;
+  }
+
+  /**
+   * Check if an ElevenLabs session exists in either memory or Redis
+   * This should be used when one process needs to verify a session that might
+   * exist in another process.
+   * @param {string} sessionId - The session ID to check
+   * @returns {Promise<{exists: boolean, owner: number|null, status: string|null}>} - Session details
+   */
+  async sessionExistsAnywhere(sessionId) {
+    // Check local memory first
+    const inMemory = activeSessions.has(sessionId);
+    let owner = null;
+    let status = null;
+    
+    if (inMemory) {
+      const session = activeSessions.get(sessionId);
+      status = session.status;
+      owner = session.processId || process.pid;
+      
+      return { exists: true, owner, status, inMemory };
+    }
+    
+    // Session not in memory, check Redis
+    try {
+      const { sessionManager } = require('./redisClient');
+      
+      // Check for session data
+      const redisData = await sessionManager.getOutboundSession(sessionId);
+      
+      // Check for session ownership
+      owner = await sessionManager.getSessionOwner(sessionId);
+      
+      if (redisData) {
+        status = redisData.status || 'unknown';
+        return { exists: true, owner, status, inMemory: false };
+      }
+      
+      // Neither in memory nor in Redis
+      return { exists: false, owner: null, status: null, inMemory: false };
+    } catch (error) {
+      logger.error(`[${sessionId}] Error checking session existence in Redis:`, error);
+      // Default to reporting only what we know for sure - it's in memory or not
+      return { exists: inMemory, owner, status, inMemory };
+    }
+  }
+
+  /**
+   * Attempt to take ownership of a session that might be in another process
+   * @param {string} sessionId - The session ID to take ownership of
+   * @returns {Promise<boolean>} - True if ownership was acquired or already held
+   */
+  async acquireSessionIfExists(sessionId) {
+    try {
+      // Check if the session exists anywhere
+      const sessionInfo = await this.sessionExistsAnywhere(sessionId);
+      
+      if (!sessionInfo.exists) {
+        logger.warn(`[${sessionId}] Cannot acquire non-existent session`);
+        return false;
+      }
+      
+      // If it's in our memory, we already have it
+      if (sessionInfo.inMemory) {
+        logger.debug(`[${sessionId}] Session already in local memory, no need to acquire`);
+        return true;
+      }
+      
+      // Attempt to acquire ownership in Redis
+      const { sessionManager } = require('./redisClient');
+      const acquired = await sessionManager.acquireSessionOwnership(sessionId, process.pid);
+      
+      if (acquired) {
+        logger.info(`[${sessionId}] Successfully acquired ownership of remote session`);
+        // Note: we don't have the actual WebSocket connection, just the metadata
+        // The actual connection exists in another process
+        return true;
+      } else {
+        logger.warn(`[${sessionId}] Failed to acquire ownership of remote session (owner: ${sessionInfo.owner})`);
+        return false;
+      }
+    } catch (error) {
+      logger.error(`[${sessionId}] Error acquiring session ownership:`, error);
+      return false;
+    }
+  }
+
+  constructor_http() { // Keep original constructor logic for HTTP methods if needed
+    this.apiKey = process.env.ELEVENLABS_API_KEY;
+    this.baseUrl = 'https://api.elevenlabs.io/v1';
+    this.voiceId = process.env.ELEVENLABS_VOICE_ID;
+    // Agent ID is used for WebSocket connection now
+    
+    this.axiosInstance = axios.create({
+      baseURL: this.baseUrl,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'xi-api-key': this.apiKey
+      }
+    });
+  }
+
+  /**
+   * Generate speech from text (HTTP method)
+   */
+  async textToSpeech(text, voiceId = this.voiceId, options = {}) {
+     // Need to instantiate axios if not done in constructor
+     if (!this.axiosInstance) { this.constructor_http(); }
+    try {
+      const response = await this.axiosInstance.post(
+        `/text-to-speech/${voiceId}`,
+        {
+          text,
+          model_id: options.modelId || 'eleven_monolingual_v1',
+          voice_settings: {
+            stability: options.stability || 0.5,
+            similarity_boost: options.similarityBoost || 0.75,
+          }
+        },
+        {
+          responseType: 'arraybuffer'
+        }
+      );
+      logger.info(`Generated speech for text (${text.length} chars)`);
+      return response.data;
+    } catch (error) {
+      logger.error('Error in text-to-speech:', error.response?.status, error.response?.data);
+      throw error;
+    }
+  }
+
+  /**
+   * Get available voices (HTTP method)
+   */
+  async getVoices() {
+     // Need to instantiate axios if not done in constructor
+     if (!this.axiosInstance) { this.constructor_http(); }
+    try {
+      const response = await this.axiosInstance.get('/voices');
+      logger.info(`Retrieved ${response.data.voices.length} voices`);
+      return response.data.voices;
+    } catch (error) {
+      logger.error('Error getting voices:', error.response?.status, error.response?.data);
+      throw error;
+    }
+  }
+
+  // New method to check for termination requests from other processes
+  async _checkForTerminationRequests(sessionId) {
+    try {
+      const { sessionManager } = require('./redisClient');
+      const sessionData = await sessionManager.getOutboundSession(sessionId);
+      
+      if (sessionData && sessionData.terminateRequested) {
+        logger.info(`[${sessionId}] Detected termination request from process ${sessionData.terminateRequestedBy || 'unknown'}`);
+        
+        // Close the session as requested by another process
+        this._stopHeartbeat(sessionId);
+        
+        const session = activeSessions.get(sessionId);
+        if (session && session.ws) {
+          session.status = 'CLOSING';
+          session.ws.close(1000, `Termination requested by process ${sessionData.terminateRequestedBy}`);
+        }
+        
+        // Update Redis to acknowledge termination request
+        await sessionManager.saveOutboundSession(sessionId, {
+          ...sessionData,
+          status: 'closing',
+          terminationAcknowledged: true,
+          terminationAcknowledgedBy: process.pid,
+          terminationAcknowledgedTime: Date.now()
+        });
+      }
+    } catch (error) {
+      logger.error(`[${sessionId}] Error checking for termination requests:`, error);
+    }
+  }
+
+  // New method to set up a Redis subscription for Twilio audio
+  async _setupTwilioAudioSubscription(sessionId) {
+    try {
+      const { subscriberClient } = require('./redisClient');
+      const audioChannel = `twilio-to-elevenlabs:${sessionId}`;
+      
+      // Subscribe to the audio channel
+      await subscriberClient.subscribe(audioChannel, (message) => {
+        try {
+          const data = JSON.parse(message);
+          
+          if (data.audioBase64) {
+            logger.info(`[${sessionId}] Received Twilio audio from process ${data.sourceProcess || 'unknown'} via Redis`);
+            
+            // Forward the audio to ElevenLabs
+            this.sendAudioChunk(sessionId, data.audioBase64);
+          }
+        } catch (error) {
+          logger.error(`[${sessionId}] Error processing Twilio audio from Redis:`, error);
+        }
+      });
+      
+      logger.info(`[${sessionId}] Set up subscription for Twilio audio from server process`);
+    } catch (error) {
+      logger.error(`[${sessionId}] Error setting up Twilio audio subscription:`, error);
+    }
+  }
+  
+  // Method to periodically check for Twilio audio messages in Redis
+  async _checkForTwilioAudio(sessionId) {
+    // This is now handled by the subscription, but we could add additional checks here if needed
+  }
+
+  /**
+   * Handle text-to-speech for text-only agent_response messages
+   * This method converts text response into audio using the ElevenLabs API
+   * @param {string} sessionId - The session ID
+   * @param {string} text - The text to convert to speech
+   */
+  async synthesizeResponseSpeech(sessionId, text) {
+    const logPrefix = `[${sessionId}]`;
+    logger.info(`${logPrefix} Synthesizing speech for text: "${text}"`);
+    
+    try {
+      // Use the HTTP API to generate speech
+      // Need to instantiate axios if not done in constructor
+      if (!this.axiosInstance) { this.constructor_http(); }
+      
+      // Use the voice ID from environment or a default
+      const voiceId = process.env.ELEVENLABS_VOICE_ID || "2TZsZhDderJmpU6LPJxJ";
+      
+      logger.info(`${logPrefix} Requesting speech synthesis using voice ID: ${voiceId}`);
+      
+      // Make the API call to convert text to speech with explicit format settings
+      const response = await this.axiosInstance.post(
+        `/text-to-speech/${voiceId}`,
+        {
+          text,
+          model_id: 'eleven_monolingual_v1',
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.75,
+          },
+          output_format: "mulaw_8000" // Request mulaw with 8kHz explicitly
+        },
+        {
+          responseType: 'stream', // Get as stream instead of arraybuffer
+          headers: {
+            'Accept': 'audio/basic', // Standard MIME type for μ-law audio
+          }
+        }
+      );
+      
+      // Convert the stream response to ArrayBuffer using proper stream handling
+      const { Readable } = require('stream');
+      const responseStream = Readable.from(response.data);
+      const audioArrayBuffer = await this.streamToArrayBuffer(responseStream);
+      
+      // Convert ArrayBuffer to base64 in the format Twilio expects
+      const audioBase64 = Buffer.from(audioArrayBuffer).toString('base64');
+      
+      logger.info(`${logPrefix} Successfully synthesized speech (${audioBase64.length} bytes) using mulaw_8000 format`);
+      
+      // Now send this audio to the WebSocket connection or Redis
+      if (this.isSessionActiveOrOpening(sessionId)) {
+        // If session is local, directly handle the audio as an audio message
+        const message = {
+          type: 'audio',
+          audio_event: {
+            audio_base64: audioBase64
+          }
+        };
+        // Process through our message handler as if it came from ElevenLabs
+        const { handleElevenLabsMessage } = require('./elevenlabsHandlers');
+        await handleElevenLabsMessage(sessionId, message);
+        logger.info(`${logPrefix} Forwarded synthesized speech as audio message`);
+        return true;
+      } else {
+        // Try to check if the session exists elsewhere
+        const sessionInfo = await this.sessionExistsAnywhere(sessionId);
+        if (sessionInfo.exists && sessionInfo.owner) {
+          logger.info(`${logPrefix} Session owned by another process (${sessionInfo.owner}), publishing synthesized audio to Redis`);
+          
+          // Publish to Redis for the server to send to Twilio with comprehensive metadata
+          const { sessionManager } = require('./redisClient');
+          const audioChannel = `audio:${sessionId}`;
+          
+          // Add sequence counter for synthesized speech
+          let sequenceNumber = 0;
+          try {
+            // Import needed for sequenceCounters
+            const { sequenceCounters } = require('./elevenlabsHandlers');
+            if (sequenceCounters.has(sessionId)) {
+              sequenceNumber = sequenceCounters.get(sessionId);
+              sequenceCounters.set(sessionId, sequenceNumber + 1);
+            }
+          } catch (error) {
+            logger.warn(`${logPrefix} Could not access sequence counters: ${error.message}`);
+          }
+          
+          // Update Redis payload format to match the new standards
+          const payload = JSON.stringify({ 
+            audioBase64, 
+            source: 'synthesized-speech',
+            processId: process.pid,
+            timestamp: Date.now(),
+            format: 'mulaw', // Use mulaw format string
+            sampleRate: 8000,
+            sequenceNumber,
+            track: 'outbound',
+            contentType: 'audio/x-mulaw', // Use standard MIME type
+            encoding: 'mulaw'
+          });
+          
+          await sessionManager.publishAudio(audioChannel, payload);
+          logger.info(`${logPrefix} Published synthesized speech to Redis channel ${audioChannel} with sequence ${sequenceNumber}`);
+          return true;
+        } else {
+          logger.warn(`${logPrefix} Failed to send synthesized speech - no active session found`);
+          return false;
+        }
+      }
+    } catch (error) {
+      logger.error(`${logPrefix} Error synthesizing speech: ${error.message}`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Utility function to convert a readable stream to an ArrayBuffer
+   * This follows the pattern used in the ElevenLabs Twilio documentation
+   * @param {ReadableStream} readableStream - The stream to convert
+   * @returns {Promise<ArrayBuffer>} - The stream data as ArrayBuffer
+   */
+  streamToArrayBuffer(readableStream) {
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      
+      readableStream.on('data', (chunk) => {
+        chunks.push(chunk);
+      });
+      
+      readableStream.on('end', () => {
+        resolve(Buffer.concat(chunks).buffer);
+      });
+      
+      readableStream.on('error', reject);
+    });
+  }
+}
+
+module.exports = new ElevenLabsWebSocketClient(); 
